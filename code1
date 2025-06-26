@@ -1,0 +1,404 @@
+# app.py - Main FastAPI application
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+import os
+import shutil
+import uuid
+from datetime import datetime
+import re
+import torch
+from langchain.prompts import PromptTemplate
+
+
+# Database imports
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
+
+# ML/AI imports
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
+from langchain_huggingface import HuggingFacePipeline
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
+# FastAPI app initialization
+app = FastAPI(title="Academic Assistant API")
+
+# CORS setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Firebase initialization
+try:
+    cred = credentials.Certificate("firebase_key.json")
+    firebase_admin.initialize_app(cred, {
+        'storageBucket': 'chatbot-99c42.appspot.com'
+    })
+    db = firestore.client()
+    bucket = storage.bucket()
+    print("✅ Firebase initialized successfully")
+except Exception as e:
+    print(f"❌ Firebase initialization error: {e}")
+
+# Vector database setup
+PERSIST_DIRECTORY = "./chroma_db"
+os.makedirs(PERSIST_DIRECTORY, exist_ok=True)
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+vector_db = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embeddings)
+print(f"✅ Vector database loaded with {vector_db._collection.count()} documents")
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# ✅ Preload academic content from your syllabus PDF
+pdf_path = os.path.join("data", "CADX155_AI_Syllabus_Notes.pdf")
+
+if os.path.exists(pdf_path):
+    loader = PyPDFLoader(pdf_path)
+    documents = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = splitter.split_documents(documents)
+
+    for chunk in chunks:
+        chunk.metadata.update({
+            "title": "CADX 155 AI Notes",
+            "department": "BCA",
+            "subject_code": "CADX155",
+            "type": "syllabus_notes",
+            "source": "CADX155_AI_Syllabus_Notes.pdf"
+        })
+
+    vector_db.add_documents(chunks)
+    print("✅ Sample academic PDF loaded and indexed.")
+else:
+    print("❌ PDF not found at:", pdf_path)
+
+
+
+# LLM model initialization
+try:
+    # LLM model initialization
+    try:
+        model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=512,
+            temperature=0.7,
+            do_sample=True,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+
+        llm = HuggingFacePipeline(pipeline=pipe)
+
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
+        # (Optional) prompt and qa_chain setup...
+
+        print("✅ LLM and QA chain initialized successfully")
+
+    except Exception as e:
+        print(f"❌ LLM initialization error: {e}")
+        qa_chain = None
+    from langchain.chains import RetrievalQA
+
+    prompt = PromptTemplate(
+        input_variables=["context", "question"],
+        template="""
+    You are an academic assistant chatbot. Use the given CONTEXT to answer the QUESTION below in simple, clear terms.
+
+    Only include relevant information. Do not repeat instructions or include system messages.
+
+    CONTEXT:
+    {context}
+
+    QUESTION:
+    {question}
+
+    ANSWER:
+    """
+    )
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=vector_db.as_retriever(search_kwargs={"k": 5}),
+        chain_type="stuff",
+        chain_type_kwargs={"prompt": prompt}
+    )
+
+    qa_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=vector_db.as_retriever(search_kwargs={"k": 3}),
+        memory=memory,
+        combine_docs_chain_kwargs={"prompt": prompt}
+    )
+    print("✅ LLM and QA chain initialized successfully")
+except Exception as e:
+    print(f"❌ LLM initialization error: {e}")
+    qa_chain = None
+
+# ===================== Data Models =========================
+class UserCreate(BaseModel):
+    email: str
+    name: str
+    department: str
+    semester: Optional[str] = None
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class QueryRequest(BaseModel):
+    query: str
+    user_id: str
+    conversation_id: Optional[str] = None
+    chat_history: Optional[List[ChatMessage]] = []
+
+class AcademicContent(BaseModel):
+    title: str
+    department: str
+    subject_code: str
+    content_type: str
+    metadata: Optional[Dict[str, Any]] = None
+
+class ImportantDate(BaseModel):
+    title: str
+    date: datetime
+    department: str
+    event_type: str
+    description: Optional[str] = None
+
+# =================== Helper Functions ======================
+def save_to_chat_history(user_id, conversation_id, query, response):
+    if not conversation_id:
+        conversation_id = str(uuid.uuid4())
+
+    conv_ref = db.collection("chat_history").document(user_id).collection("conversations").document(conversation_id)
+    if not conv_ref.get().exists:
+        conv_ref.set({
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "title": query[:30] + "..." if len(query) > 30 else query
+        })
+
+    messages_ref = conv_ref.collection("messages")
+    messages_ref.add({"role": "user", "content": query, "timestamp": firestore.SERVER_TIMESTAMP})
+    messages_ref.add({"role": "assistant", "content": response, "timestamp": firestore.SERVER_TIMESTAMP})
+
+    return conversation_id
+
+def format_dates_response(dates, event_type):
+    if not dates:
+        return f"No {event_type} dates found."
+    response = f"Here are the upcoming {event_type} dates:\n\n"
+    for date in dates:
+        response += f"- {date['title']}: {date['date'].strftime('%d %B %Y')}\n"
+    return response
+
+def search_academic_content(query, department, subject_code=None):
+    content_ref = db.collection("academic_content").document(department)
+    if subject_code:
+        content_ref = content_ref.collection(subject_code)
+    else:
+        subjects = content_ref.collections()
+        results = []
+        for subject in subjects:
+            for doc in subject.stream():
+                if query.lower() in doc.to_dict().get("title", "").lower():
+                    results.append(doc.to_dict())
+        if results:
+            return results
+    return None
+
+# ==================== API Routes ============================
+@app.post("/api/users", response_model=dict)
+async def create_user(user: UserCreate):
+    try:
+        user_ref = db.collection("users").document()
+        user_ref.set({**user.dict(), "created_at": firestore.SERVER_TIMESTAMP})
+        return {"user_id": user_ref.id, "message": "User created successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def clean_llm_response(text: str) -> str:
+    # Remove known noisy patterns
+    noisy_phrases = [
+        "You are a helpful academic assistant chatbot",
+        "Context:",
+        "Commented [1]:"
+    ]
+    for phrase in noisy_phrases:
+        text = text.replace(phrase, "")
+    return text.strip()
+
+# ✅ Put this near your other helper functions (like save_to_chat_history)
+def query_type_is_factual(query: str) -> bool:
+    keywords = [
+        "explain", "define", "describe", "what is", "types of",
+        "advantages", "disadvantages", "principles", "components",
+        "architecture", "examples of", "structure of"
+    ]
+    query = query.lower()
+    return any(keyword in query for keyword in keywords)
+
+@app.post("/api/query", response_model=dict)
+async def process_query(request: QueryRequest):
+    try:
+        user_ref = db.collection("users").document(request.user_id)
+        user = user_ref.get()
+        if not user.exists:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        department = user.to_dict().get("department")
+        query_lower = request.query.lower()
+
+        # ✅ Firebase quick response
+        if "exam" in query_lower and ("date" in query_lower or "when" in query_lower):
+            dates = db.collection("important_dates").document(department).get().to_dict()
+            exam_dates = dates.get("exam_dates", []) if dates else []
+            response = format_dates_response(exam_dates, "exam")
+
+        elif "assignment" in query_lower and ("deadline" in query_lower or "due" in query_lower):
+            dates = db.collection("important_dates").document(department).get().to_dict()
+            assignment_dates = dates.get("assignment_deadlines", []) if dates else []
+            response = format_dates_response(assignment_dates, "assignment")
+
+        # ✅ Short factual queries (no history)
+        elif query_type_is_factual(request.query):
+            if qa_chain:
+                result = await qa_chain.ainvoke({"question": request.query})
+                raw_answer = result.get("answer", "") or result.get("result", "")
+                response = clean_llm_response(raw_answer or "No answer found.")
+            else:
+                response = "Sorry, assistant is offline."
+
+        # ✅ Conversational fallback
+        else:
+            if qa_chain:
+                result = await qa_chain.ainvoke({
+                    "question": request.query,
+                    "chat_history": request.chat_history
+                })
+                raw_answer = result.get("answer", "") or result.get("result", "")
+                response = clean_llm_response(raw_answer or "Sorry, I couldn't generate a good answer.")
+            else:
+                response = "Chatbot is unavailable."
+
+        conversation_id = save_to_chat_history(request.user_id, request.conversation_id, request.query, response)
+        return {"response": response, "conversation_id": conversation_id}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/upload-content")
+async def upload_academic_content(file: UploadFile = File(...), title: str = None, department: str = None, subject_code: str = None, content_type: str = None):
+    try:
+        temp_dir = "./temp_uploads"
+        os.makedirs(temp_dir, exist_ok=True)
+        file_path = os.path.join(temp_dir, file.filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        blob = bucket.blob(f"academic_content/{department}/{subject_code}/{file.filename}")
+        blob.upload_from_filename(file_path)
+        blob.make_public()
+        file_url = blob.public_url
+
+        if file.filename.endswith('.pdf'):
+            loader = PyPDFLoader(file_path)
+        elif file.filename.endswith('.txt'):
+            loader = TextLoader(file_path)
+        else:
+            return {"message": "Unsupported file format", "url": file_url}
+
+        documents = loader.load()
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        chunks = splitter.split_documents(documents)
+        for chunk in chunks:
+            chunk.metadata.update({
+                "title": title,
+                "department": department,
+                "subject_code": subject_code,
+                "type": content_type,
+                "source": file.filename
+            })
+
+        vector_db.add_documents(chunks)
+        vector_db.persist()
+
+        db.collection("academic_content").document(department).collection(subject_code).add({
+            "title": title,
+            "type": content_type,
+            "file_path": file_url,
+            "filename": file.filename,
+            "timestamp": firestore.SERVER_TIMESTAMP
+        })
+
+        os.remove(file_path)
+        return {"message": "File uploaded successfully", "url": file_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/important-dates")
+async def add_important_date(date: ImportantDate):
+    try:
+        dates_ref = db.collection("important_dates").document(date.department)
+        doc = dates_ref.get()
+        current_dates = doc.to_dict() if doc.exists else {"exam_dates": [], "assignment_deadlines": [], "feedback_deadlines": []}
+
+        if date.event_type == "exam":
+            current_dates["exam_dates"].append(date.dict())
+        elif date.event_type == "assignment":
+            current_dates["assignment_deadlines"].append(date.dict())
+        elif date.event_type == "feedback":
+            current_dates["feedback_deadlines"].append(date.dict())
+
+        dates_ref.set(current_dates, merge=True)
+        return {"message": f"{date.event_type} date added successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat-history/{user_id}")
+async def get_chat_history(user_id: str):
+    try:
+        conv_ref = db.collection("chat_history").document(user_id).collection("conversations")
+        conversations = conv_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).stream()
+        result = []
+        for conv in conversations:
+            conv_data = conv.to_dict()
+            conv_data["id"] = conv.id
+            result.append(conv_data)
+        return {"conversations": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversation/{user_id}/{conversation_id}")
+async def get_conversation(user_id: str, conversation_id: str):
+    try:
+        msg_ref = db.collection("chat_history").document(user_id).collection("conversations").document(conversation_id).collection("messages")
+        messages = msg_ref.order_by("timestamp").stream()
+        return {"messages": [msg.to_dict() for msg in messages]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Run FastAPI server
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
