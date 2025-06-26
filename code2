@@ -38,20 +38,4 @@ void printArray(int arr[], int size)
     printf("\n");
 }
 
-int main() 
-{
-    int n, i;
-    printf("Enter number of elements: ");
-    scanf("%d", &n);
-    int arr[n];  
-    printf("Enter %d elements: ", n);
-    for (i = 0; i < n; i++) 
-        scanf("%d", &arr[i]);    
-    printf("Original array: ");
-    printArray(arr, n);
-    quickSort(arr, 0, n - 1);
-    printf("Sorted array: ");
-    printArray(arr, n);
-    printf("This program was executed by Syed Hashim - 230171601185");
-    return 0;
-}
+
