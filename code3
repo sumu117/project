@@ -59,4 +59,3 @@ int main()
     return 0;
 }
 printf("the above program is done")
-printf("yaseen loves mizba")
