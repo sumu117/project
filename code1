@@ -1,3 +1,4 @@
+the code is for the better understanding 
 # app.py - Main FastAPI application
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
